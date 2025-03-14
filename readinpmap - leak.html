@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="content-type" content="text/html; charset=UTF-8" />
+    <title>EPANET 管網 GPS 地圖(需求異常 + 相連節點 + 熱力圖可關閉)</title>
+    <style>
+        html, body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+        }
+        #map {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            right: 0;
+            left: 0;
+        }
+        #controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 1000;
+            background-color: white;
+            padding: 8px;
+            border-radius: 8px;
+            box-shadow: 0 0 4px rgba(0,0,0,0.3);
+        }
+        .label {
+            display: block;
+            font-weight: bold;
+            margin-bottom: 4px;
+        }
+        .btn {
+            margin-top: 6px;
+            padding: 6px 12px;
+            border: none;
+            border-radius: 4px;
+            background-color: #3B82F6;
+            color: #fff;
+            cursor: pointer;
+        }
+        .btn:hover {
+            background-color: #2563EB;
+        }
+    </style>
+
+    <!-- Leaflet core -->
+    <script src="https://cdn.jsdelivr.net/npm/leaflet@1.6.0/dist/leaflet.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.6.0/dist/leaflet.css"/>
+
+    <!-- Leaflet Heat plugin -->
+    <script src="https://leaflet.github.io/Leaflet.heat/dist/leaflet-heat.js"></script>
+
+    <!-- proj4 for TWD97 -> WGS84 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.7.5/proj4.js"></script>
+</head>
+<body>
+<div id="map"></div>
+<div id="controls">
+    <div>
+        <label class="label">載入 INP 檔:</label>
+        <input type="file" id="inpFileInput" accept=".inp"/>
+    </div>
+    <hr>
+    <div>
+        <label class="label" for="demandThreshold">需求熱力閥值 (上限):</label>
+        <input type="range" id="demandThreshold" min="1" max="50" step="1" value="10"/>
+        <span id="thresholdValue">10</span>
+    </div>
+    <div>
+        <label>
+            <input type="checkbox" id="toggleHeatmap" checked>
+            顯示需求熱力圖
+        </label>
+    </div>
+    <hr>
+    <button class="btn" id="btnFindHighDemand">找出需求異常 + 相連節點</button>
+    <div>
+        <label>
+            <input type="checkbox" id="toggleLeakHeat" checked>
+            顯示可疑漏水點熱力圖
+        </label>
+    </div>
+</div>
+<script>
+    // ======== 地圖初始化 ========
+    var map = L.map('map').setView([24.2515, 120.5640], 16);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: 'Data &copy; <a href="http://openstreetmap.org">OpenStreetMap</a>',
+        maxZoom: 18
+    }).addTo(map);
+
+    // ======== 全域變數 ========
+    var nodes = {};
+    var pipes = {};
+    var vertices = {};
+
+    // 需求熱力閥值
+    var demandThreshold = 10;
+
+    // 用來呈現所有節點需求熱力圖
+    var heatLayer = null;
+    // 可疑漏水點(需求異常) + 相連節點的圖層
+    var highlightLayer = null;
+    // 可疑漏水點的熱力圖
+    var leakHeatLayer = null;
+
+    // proj4 轉換 TWD97 -> WGS84
+    function convertTWD97toWGS84(x, y) {
+        try {
+            var wgs84 = proj4(
+                '+proj=tmerc +lat_0=0 +lon_0=121 +k=0.9999 +x_0=250000 +y_0=0 +ellps=GRS80 +units=m +no_defs',
+                'EPSG:4326',
+                [x, y]
+            );
+            return { lat: wgs84[1], lng: wgs84[0] };
+        } catch (err) {
+            console.error("座標轉換錯誤", err);
+            return null;
+        }
+    }
+
+    // ========== 讀檔 & 解析 ==========
+    document.getElementById('inpFileInput').addEventListener('change', function(e){
+        var file = e.target.files[0];
+        if(!file) return;
+
+        var reader = new FileReader();
+        reader.onload = function(evt){
+            var text = evt.target.result;
+            var lines = text.split('\n');
+            var section = null;
+
+            // 重新初始化
+            nodes = {};
+            pipes = {};
+            vertices = {};
+
+            lines.forEach(function(lineRaw){
+                var line = lineRaw.trim();
+                // 跳過空行或註解
+                if(!line || line.startsWith(';')){
+                    return;
+                }
+                // 移除行尾註解
+                if(line.indexOf(';') !== -1){
+                    line = line.split(';')[0].trim();
+                }
+                if(!line){
+                    return;
+                }
+
+                // 檢查 [Section]
+                if(line.startsWith('[') && line.endsWith(']')){
+                    section = line.replace(/[\[\]]/g, '');
+                    return;
+                }
+
+                var parts = line.split(/\s+/);
+                if(section === 'COORDINATES' && parts.length >= 3){
+                    // COORDINATES
+                    var nID = parts[0];
+                    var x = parseFloat(parts[1]);
+                    var y = parseFloat(parts[2]);
+                    var latlng = convertTWD97toWGS84(x,y);
+                    if(!nodes[nID]){
+                        nodes[nID] = {
+                            latlng: null,
+                            elevation: 0,
+                            base_demand: 0,
+                            pattern: null
+                        };
+                    }
+                    if(latlng){
+                        nodes[nID].latlng = latlng;
+                    }
+                } else if(section === 'JUNCTIONS' && parts.length >= 3){
+                    // JUNCTIONS:  ID  Elevation  Demand  Pattern?
+                    var jID = parts[0];
+                    var elev = parseFloat(parts[1]) || 0;
+                    var demand = parseFloat(parts[2]) || 0;
+                    var pat = (parts.length>3) ? parts.slice(3).join(' ') : null;
+
+                    if(!nodes[jID]){
+                        nodes[jID] = {
+                            latlng: null,
+                            elevation: 0,
+                            base_demand: 0,
+                            pattern: null
+                        };
+                    }
+                    nodes[jID].elevation = elev;
+                    nodes[jID].base_demand = demand;
+                    nodes[jID].pattern = pat;
+                } else if(section === 'PIPES' && parts.length >= 6){
+                    // PIPES: ID  StartNode  EndNode  Length  Diameter  Roughness
+                    var pipeID = parts[0];
+                    var startNode = parts[1];
+                    var endNode = parts[2];
+                    var lenVal = parseFloat(parts[3]) || 0;
+                    var diaVal = parseFloat(parts[4]) || 0;
+                    var roughVal = parseFloat(parts[5]) || 0;
+
+                    pipes[pipeID] = {
+                        start: startNode,
+                        end: endNode,
+                        length: lenVal,
+                        diameter: diaVal,
+                        roughness: roughVal,
+                        path: []
+                    };
+                } else if(section === 'VERTICES' && parts.length >= 3){
+                    // VERTICES: pipeID  X  Y
+                    var pipeKey = parts[0];
+                    var vx = parseFloat(parts[1]);
+                    var vy = parseFloat(parts[2]);
+                    var vlatlng = convertTWD97toWGS84(vx, vy);
+                    if(vlatlng){
+                        if(!vertices[pipeKey]){
+                            vertices[pipeKey] = [];
+                        }
+                        vertices[pipeKey].push(vlatlng);
+                    }
+                } else {
+                    // 其他區段暫不解析
+                }
+            });
+
+            drawMap();
+        };
+        reader.readAsText(file);
+    });
+
+    // ========== 需求熱力閥值 ==========
+    document.getElementById('demandThreshold').addEventListener('input', function(e){
+        demandThreshold = parseFloat(e.target.value);
+        document.getElementById('thresholdValue').textContent = demandThreshold;
+        // 如果 checkbox 有勾選，就更新熱力圖
+        if(document.getElementById('toggleHeatmap').checked){
+            updateHeatMap();
+        } else {
+            // 如果關閉，就移除
+            if(heatLayer){
+                map.removeLayer(heatLayer);
+                heatLayer = null;
+            }
+        }
+    });
+
+    // ========== 顯示/關閉 需求熱力圖 ==========
+    document.getElementById('toggleHeatmap').addEventListener('change', function(e){
+        if(e.target.checked){
+            // 開啟熱力圖
+            updateHeatMap();
+        } else {
+            // 關閉熱力圖
+            if(heatLayer){
+                map.removeLayer(heatLayer);
+                heatLayer = null;
+            }
+        }
+    });
+
+    // ========== 顯示/關閉 可疑漏水點熱力圖 ============
+    document.getElementById('toggleLeakHeat').addEventListener('change', function(e){
+        if(!leakHeatLayer) return;
+        if(e.target.checked){
+            leakHeatLayer.addTo(map);
+        } else {
+            map.removeLayer(leakHeatLayer);
+        }
+    });
+
+    // ========== 繪製地圖 ==========
+    function drawMap(){
+        // 移除所有非底圖
+        map.eachLayer(function(layer){
+            if(layer instanceof L.TileLayer) return;
+            map.removeLayer(layer);
+        });
+
+        // 重加底圖
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: 'Data &copy; <a href=\"http://openstreetmap.org\">OpenStreetMap</a>',
+            maxZoom: 18
+        }).addTo(map);
+
+        // 繪製管線
+        Object.keys(pipes).forEach(function(pipeID){
+            var p = pipes[pipeID];
+            var latlngs = [];
+
+            if(nodes[p.start] && nodes[p.start].latlng){
+                latlngs.push(nodes[p.start].latlng);
+            }
+            if(vertices[pipeID]){
+                latlngs = latlngs.concat(vertices[pipeID]);
+            }
+            if(nodes[p.end] && nodes[p.end].latlng){
+                latlngs.push(nodes[p.end].latlng);
+            }
+
+            if(latlngs.length>1){
+                L.polyline(latlngs, {color:'blue', weight:2.5})
+                    .bindTooltip(`管線ID: ${pipeID}<br>長度:${p.length}m<br>管徑:${p.diameter}mm<br>粗糙度:${p.roughness}`)
+                    .addTo(map);
+            }
+        });
+
+        // 繪製節點 (一般節點用綠色標示)
+        Object.keys(nodes).forEach(function(nid){
+            var nd = nodes[nid];
+            if(nd.latlng){
+                L.circleMarker(nd.latlng, {
+                    color:'cyan',
+                    radius:3
+                }).bindTooltip(
+                    `節點ID:${nid}<br>`+
+                    `高程:${nd.elevation}m<br>`+
+                    `需求量:${nd.base_demand}L/s<br>`+
+                    `模式:${nd.pattern || '無'}`
+                ).addTo(map);
+            }
+        });
+
+        // 如果熱力圖打勾，就更新
+        if(document.getElementById('toggleHeatmap').checked){
+            updateHeatMap();
+        }
+    }
+
+    // ========== 建立需求熱力圖 ==========
+    function updateHeatMap(){
+        // 先移除舊的
+        if(heatLayer){
+            map.removeLayer(heatLayer);
+            heatLayer = null;
+        }
+
+        var heatData = [];
+        Object.keys(nodes).forEach(function(nid){
+            var nd = nodes[nid];
+            if(!nd.latlng) return;
+            if(nd.base_demand>0){
+                var intensity = nd.base_demand / demandThreshold;
+                if(intensity>1) intensity=1;
+                if(intensity<0) intensity=0;
+                heatData.push([
+                    nd.latlng.lat,
+                    nd.latlng.lng,
+                    intensity
+                ]);
+            }
+        });
+
+        heatLayer = L.heatLayer(heatData, {
+            radius:25,
+            blur:15,
+            maxZoom:17
+        }).addTo(map);
+    }
+
+    // ========== 計算平均 & 標準差 ==========
+    function getMeanStd(arr){
+        if(!arr.length) return {mean:0,std:0};
+        var sum=0;
+        arr.forEach(function(v){ sum+=v; });
+        var mean = sum/arr.length;
+        var variance=0;
+        arr.forEach(function(v){
+            variance += Math.pow(v - mean,2);
+        });
+        variance=variance/arr.length;
+        return {mean:mean, std:Math.sqrt(variance)};
+    }
+
+    // ========== 找出需求量異常 & 相連節點 ==========
+    document.getElementById('btnFindHighDemand').addEventListener('click', function(){
+        // 先清除之前圖層
+        if(highlightLayer){
+            map.removeLayer(highlightLayer);
+            highlightLayer = null;
+        }
+        if(leakHeatLayer){
+            map.removeLayer(leakHeatLayer);
+            leakHeatLayer = null;
+        }
+
+        highlightLayer = L.layerGroup();
+
+        // 計算mean & std
+        var demandArr = [];
+        Object.keys(nodes).forEach(function(nid){
+            demandArr.push(nodes[nid].base_demand);
+        });
+        var ds = getMeanStd(demandArr);
+        var limit = ds.mean + 2*ds.std;
+
+        // 收集高需求節點
+        var highDemandSet = {};
+        Object.keys(nodes).forEach(function(nid){
+            if(nodes[nid].base_demand > limit){
+                highDemandSet[nid] = true;
+            }
+        });
+
+        // 收集所有需要 highlight 的節點
+        var highlightNodes = {};
+
+        // 1) 直接把高需求節點標記
+        Object.keys(highDemandSet).forEach(function(nid){
+            highlightNodes[nid] = true;
+        });
+
+        // 2) 與高需求節點相連的管線兩端
+        Object.keys(pipes).forEach(function(pid){
+            var p = pipes[pid];
+            if(highDemandSet[p.start] || highDemandSet[p.end]){
+                highlightNodes[p.start] = true;
+                highlightNodes[p.end]   = true;
+            }
+        });
+
+        // 用來建可疑漏水點的 heatData
+        var leakHeatData = [];
+
+        // 在地圖上顯示, 整理出可疑節點
+        Object.keys(highlightNodes).forEach(function(nid){
+            var nd = nodes[nid];
+            if(nd && nd.latlng){
+                // 放一個特殊樣式CircleMarker (紅色)
+                var m = L.circleMarker(nd.latlng, {
+                    radius: 6,
+                    color: 'yellow',      // 外框
+                    fillColor: 'yellow',  // 填充顏色
+                    fillOpacity: 0.7,
+                    weight: 2
+                }).bindTooltip(
+                    `可能漏水(高需求相連) 節點:${nid}<br>`+
+                    `需求量:${nd.base_demand.toFixed(2)} (門檻:${limit.toFixed(2)})`
+                );
+                m.addTo(highlightLayer);
+
+                // 建立可疑點的熱力資料, 先用 demand 當作 intensity
+                var intensity = 0;
+                if(limit > 0){
+                    intensity = nd.base_demand / limit;
+                    if(intensity>1) intensity=1;
+                    if(intensity<0) intensity=0;
+                }
+
+                leakHeatData.push([
+                    nd.latlng.lat,
+                    nd.latlng.lng,
+                    intensity
+                ]);
+            }
+        });
+
+        // 建立可疑漏水點的 heatLayer
+        leakHeatLayer = L.heatLayer(leakHeatData, {
+            radius: 25,
+            blur: 15,
+            maxZoom: 17,
+            gradient: {
+                0.4: 'blue',
+                0.65: 'lime',
+                1: 'red'
+            }
+        });
+
+        // 加入地圖
+        highlightLayer.addTo(map);
+
+        // 看看 checkbox 是否打勾, 再決定是否顯示可疑漏水熱力
+        var toggleLeak = document.getElementById('toggleLeakHeat');
+        if(toggleLeak.checked){
+            leakHeatLayer.addTo(map);
+        }
+    });
+</script>
+</body>
+</html>

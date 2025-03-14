@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="content-type" content="text/html; charset=UTF-8" />
+    <title>EPANET 管網 GPS 地圖(讀取 INP + 座標轉換 + Demand Heatmap)</title>
+    <style>
+        html, body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+        }
+        #map {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            right: 0;
+            left: 0;
+        }
+        #controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 1000;
+            background-color: white;
+            padding: 8px;
+            border-radius: 8px;
+            box-shadow: 0 0 4px rgba(0,0,0,0.3);
+        }
+        .label {
+            display: block;
+            font-weight: bold;
+            margin-bottom: 4px;
+        }
+    </style>
+
+    <!-- Leaflet core -->
+    <script src="https://cdn.jsdelivr.net/npm/leaflet@1.6.0/dist/leaflet.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.6.0/dist/leaflet.css"/>
+
+    <!-- Leaflet Heat plugin -->
+    <script src="https://leaflet.github.io/Leaflet.heat/dist/leaflet-heat.js"></script>
+
+    <!-- proj4 for TWD97 -> WGS84 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.7.5/proj4.js"></script>
+</head>
+<body>
+<div id="map"></div>
+<div id="controls">
+    <div>
+        <label class="label">載入 INP 檔:</label>
+        <input type="file" id="inpFileInput" accept=".inp"/>
+    </div>
+    <hr>
+    <div>
+        <label class="label" for="demandThreshold">需求熱力閥值 (上限): </label>
+        <input type="range" id="demandThreshold" min="1" max="50" step="1" value="10"/>
+        <span id="thresholdValue">10</span>
+    </div>
+</div>
+
+<script>
+    // 初始化地圖
+    var map = L.map('map').setView([24.2515, 120.5640], 16);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: 'Data &copy; <a href="http://openstreetmap.org">OpenStreetMap</a>',
+        maxZoom: 18
+    }).addTo(map);
+
+    // proj4 轉換 TWD97 -> WGS84
+    function convertTWD97toWGS84(x, y) {
+        try {
+            var wgs84 = proj4(
+                '+proj=tmerc +lat_0=0 +lon_0=121 +k=0.9999 +x_0=250000 +y_0=0 +ellps=GRS80 +units=m +no_defs',
+                'EPSG:4326',
+                [x, y]
+            );
+            return { lat: wgs84[1], lng: wgs84[0] };
+        } catch (err) {
+            console.error("座標轉換錯誤", err);
+            return null;
+        }
+    }
+
+    // 全域儲存節點、管線、熱力圖層等資料
+    var nodes = {};
+    var pipes = {};
+    var vertices = {};
+    var heatLayer = null;
+
+    // 需求熱力閥值(可手動調整)
+    var demandThreshold = 10; // 預設
+
+    // 解析 INP
+    document.getElementById('inpFileInput').addEventListener('change', function (evt) {
+        var file = evt.target.files[0];
+        if (!file) return;
+
+        var reader = new FileReader();
+        reader.onload = function (e) {
+            var text = e.target.result;
+            var lines = text.split('\n');
+            var section = null;
+            // 清空全域資料
+            nodes = {};
+            pipes = {};
+            vertices = {};
+
+            lines.forEach(function (lineRaw) {
+                var line = lineRaw.trim();
+                // 跳過空行或全行註解
+                if (!line || line.startsWith(';')) {
+                    return;
+                }
+                // 移除行中(第一個)分號後的內容 (EPANET 常用分號做行尾註解)
+                if (line.indexOf(';') !== -1) {
+                    line = line.split(';')[0].trim();
+                }
+                if (!line) {
+                    return;
+                }
+
+                // 如果該行是 [SECTION] 開頭
+                if (line.startsWith('[') && line.endsWith(']')) {
+                    section = line.replace(/[\[\]]/g, '');
+                    return;
+                }
+
+                // 以空白分隔，兼容多空白或 tab
+                var parts = line.split(/\s+/);
+
+                // 解析各個區段
+                if (section === 'COORDINATES' && parts.length >= 3) {
+                    var idC = parts[0];
+                    var x = parseFloat(parts[1]);
+                    var y = parseFloat(parts[2]);
+                    var converted = convertTWD97toWGS84(x, y);
+                    if (converted) {
+                        if (!nodes[idC]) {
+                            nodes[idC] = {
+                                latlng: null,
+                                elevation: 0,
+                                base_demand: 0,
+                                pattern: null
+                            };
+                        }
+                        nodes[idC].latlng = converted;
+                    }
+                }
+                else if (section === 'JUNCTIONS' && parts.length >= 3) {
+                    var jID = parts[0];
+                    var elevation = parseFloat(parts[1]) || 0;
+                    var base_demand = parseFloat(parts[2]) || 0;
+                    var pattern = (parts.length > 3) ? parts.slice(3).join(' ') : null;
+
+                    if (!nodes[jID]) {
+                        nodes[jID] = {
+                            latlng: null,
+                            elevation: 0,
+                            base_demand: 0,
+                            pattern: null
+                        };
+                    }
+                    nodes[jID].elevation = elevation;
+                    nodes[jID].base_demand = base_demand;
+                    nodes[jID].pattern = pattern;
+                }
+                else if (section === 'PIPES' && parts.length >= 6) {
+                    var pipeID = parts[0];
+                    var startNode = parts[1];
+                    var endNode = parts[2];
+                    var lengthVal = parseFloat(parts[3]) || 0;
+                    var diameterVal = parseFloat(parts[4]) || 0;
+                    var roughnessVal = parseFloat(parts[5]) || 0;
+
+                    pipes[pipeID] = {
+                        start: startNode,
+                        end: endNode,
+                        length: lengthVal,
+                        diameter: diameterVal,
+                        roughness: roughnessVal,
+                        path: []
+                    };
+                }
+                else if (section === 'VERTICES' && parts.length >= 3) {
+                    var vPipeID = parts[0];
+                    var vx = parseFloat(parts[1]);
+                    var vy = parseFloat(parts[2]);
+                    var vConverted = convertTWD97toWGS84(vx, vy);
+                    if (vConverted) {
+                        if (!vertices[vPipeID]) {
+                            vertices[vPipeID] = [];
+                        }
+                        vertices[vPipeID].push(vConverted);
+                    }
+                }
+            });
+
+            drawMap();
+        };
+
+        reader.readAsText(file);
+    });
+
+    // 監聽 slider 變動，更新閥值並重新繪製 heatmap
+    document.getElementById('demandThreshold').addEventListener('input', function(e){
+        demandThreshold = parseFloat(e.target.value);
+        document.getElementById('thresholdValue').textContent = demandThreshold;
+        updateHeatMap();
+    });
+
+    // 繪製整個地圖 (管線、節點、熱力)
+    function drawMap(){
+        // 先清空所有圖層
+        map.eachLayer(function(layer){
+            // 保留底圖 (tileLayer) 不移除
+            if(layer instanceof L.TileLayer) return;
+            map.removeLayer(layer);
+        });
+
+        // 重加底圖
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: 'Data &copy; <a href="http://openstreetmap.org">OpenStreetMap</a>',
+            maxZoom: 18
+        }).addTo(map);
+
+        // 繪製管線
+        Object.keys(pipes).forEach(function (pipeID) {
+            var pipe = pipes[pipeID];
+            var path = [];
+
+            if (nodes[pipe.start] && nodes[pipe.start].latlng) {
+                path.push(nodes[pipe.start].latlng);
+            }
+            if (vertices[pipeID]) {
+                path = path.concat(vertices[pipeID]);
+            }
+            if (nodes[pipe.end] && nodes[pipe.end].latlng) {
+                path.push(nodes[pipe.end].latlng);
+            }
+
+            if (path.length > 1) {
+                L.polyline(path, { color: 'blue', weight: 2.5 })
+                    .bindTooltip(
+                        `管線ID: ${pipeID}<br>` +
+                        `長度: ${pipe.length} m<br>` +
+                        `管徑: ${pipe.diameter} mm<br>` +
+                        `粗糙度: ${pipe.roughness}`
+                    )
+                    .addTo(map);
+            }
+        });
+
+        // 繪製節點
+        Object.keys(nodes).forEach(function (id) {
+            var node = nodes[id];
+            if (node.latlng) {
+                L.circleMarker(node.latlng, {
+                    color: 'red',
+                    radius: 3
+                })
+                    .bindTooltip(
+                        `節點ID: ${id}<br>` +
+                        `高程: ${node.elevation} m<br>` +
+                        `基本需求: ${node.base_demand} L/s<br>` +
+                        `模式: ${node.pattern || '無'}`
+                    )
+                    .addTo(map);
+            }
+        });
+
+        // 初始化熱力圖
+        updateHeatMap();
+    }
+
+    // 依需求 (demand) 重新生成熱力層
+    function updateHeatMap(){
+        // 如果舊的 heatLayer 存在，先移除
+        if(heatLayer){
+            map.removeLayer(heatLayer);
+        }
+        // 建立 heatData: [lat, lng, intensity]
+        var heatData = [];
+        Object.keys(nodes).forEach(function(id){
+            var node = nodes[id];
+            if(node.latlng){
+                // intensity 以 base_demand / demandThreshold 作為比例，
+                // 避免超過 1
+                var intensity = node.base_demand / demandThreshold;
+                if(intensity > 1) intensity = 1;
+                if(intensity < 0) intensity = 0;
+
+                // 如果 demand = 0 就不加入; 如果要顯示整個分佈可以也加入
+                if(node.base_demand > 0){
+                    heatData.push([
+                        node.latlng.lat,
+                        node.latlng.lng,
+                        intensity
+                    ]);
+                }
+            }
+        });
+
+        // 建立 heatLayer
+        heatLayer = L.heatLayer(heatData, {
+            radius: 25,
+            blur: 15,
+            maxZoom: 17,
+            // 其他可調參數: gradient, minOpacity, maxOpacity...
+        }).addTo(map);
+    }
+</script>
+</body>
+</html>
