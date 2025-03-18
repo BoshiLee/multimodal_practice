@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <title>Leaflet + OSM + Local File Input (Toggle GeoJSON Layers)</title>
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.3/dist/leaflet.css"
+  />
+  <script
+    src="https://unpkg.com/leaflet@1.9.3/dist/leaflet.js"
+  ></script>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+    }
+    #map {
+      height: 80vh;
+      width: 100%;
+    }
+    .toolbar {
+      margin: 8px;
+    }
+    button {
+      margin-right: 4px;
+      margin-bottom: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h2>Leaflet + Local GeoJSON File (Toggle Layers)</h2>
+
+  <div id="map"></div>
+  <div class="toolbar">
+    <!-- 這個 button 用於觸發 input -->
+    <button onclick="document.getElementById('geojsonFile').click()">
+      選擇 GeoJSON 檔
+    </button>
+    <!-- 真正讀檔用的 input，隱藏起來 -->
+    <input
+      type="file"
+      id="geojsonFile"
+      style="display:none"
+      accept=".geojson"
+      onchange="handleFile(event)"
+    />
+    <!-- 這裡是用來放動態按鈕的容器 -->
+    <div id="layerButtons"></div>
+  </div>
+
+  <script>
+    // 初始化地圖
+    const map = L.map("map").setView([23.5, 121], 7);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "© OpenStreetMap"
+    }).addTo(map);
+
+    // 用來儲存每個載入的圖層及其屬性
+    // 結構類似： { layer: L.geoJSON(), fileName: "...", isVisible: true, color: "#xxxxxx" }
+    const loadedLayers = [];
+
+    // 當使用者選擇檔案後觸發
+    function handleFile(event) {
+      const file = event.target.files[0];
+      if (!file) {
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        try {
+          // 讀到的文字用 JSON.parse 解析
+          const geojsonData = JSON.parse(e.target.result);
+
+          // 產生隨機顏色
+          const color = getRandomColor();
+
+          // 建立 geoJSON 圖層 (記得先不要加到 map 上, 或者直接加也可)
+          const geoJsonLayer = L.geoJSON(geojsonData, {
+            pointToLayer: function (feature, latlng) {
+              return L.circleMarker(latlng, {
+                radius: 5,
+                fillColor: color,    // 使用隨機顏色
+                color: "#000000",
+                weight: 1,
+                opacity: 1,
+                fillOpacity: 0.8
+              });
+            },
+            style: function(feature) {
+              // 如果是 LineString 或 Polygon，則可在這裡設定顏色
+              return {
+                color: color,
+                weight: 2,
+              };
+            }
+          }).addTo(map);
+
+          // 把此 layer 的資訊存起來
+          const layerInfo = {
+            layer: geoJsonLayer,
+            fileName: file.name,  // 檔名
+            isVisible: true,
+            color: color
+          };
+          loadedLayers.push(layerInfo);
+
+          // 建立一個按鈕用來切換顯示/隱藏
+          createToggleButton(layerInfo);
+
+        } catch (err) {
+          alert("讀取或解析檔案失敗: " + err);
+        }
+      };
+      reader.readAsText(file);
+
+      // 為了保證可多次選檔，每次選擇完後，把 input 的值清空
+      event.target.value = "";
+    }
+
+    // 產生隨機色
+    function getRandomColor() {
+      const letters = "0123456789ABCDEF";
+      let color = "#";
+      for (let i = 0; i < 6; i++) {
+        color += letters[Math.floor(Math.random() * 16)];
+      }
+      return color;
+    }
+
+    // 建立按鈕來切換該 layer
+    function createToggleButton(layerInfo) {
+      const container = document.getElementById("layerButtons");
+
+      // 建立一個 button 元素
+      const btn = document.createElement("button");
+      // 按鈕文字就是檔名
+      btn.textContent = layerInfo.fileName;
+
+      // 設定按鈕的背景可用 layerInfo.color
+      // 但若覺得太鮮艷，可以寫在按鈕前面加個小色塊
+      btn.style.backgroundColor = "#eeeeee";
+      btn.style.cursor = "pointer";
+
+      // 建立一個小色塊(可選擇使用)
+      const colorSpan = document.createElement("span");
+      colorSpan.textContent = "■ ";       // 一個方塊符號
+      colorSpan.style.color = layerInfo.color;
+      // 加到按鈕最前面
+      btn.prepend(colorSpan);
+
+      // 綁定點擊事件：toggle 該 layer
+      btn.addEventListener("click", function() {
+        if (layerInfo.isVisible) {
+          map.removeLayer(layerInfo.layer);
+          layerInfo.isVisible = false;
+        } else {
+          map.addLayer(layerInfo.layer);
+          layerInfo.isVisible = true;
+        }
+      });
+
+      // 放到 container
+      container.appendChild(btn);
+    }
+  </script>
+</body>
+</html>

@@ -2,3 +2,5 @@ notebook
 transformers
 tqdm
 pyproj
+folium
+geopandas
